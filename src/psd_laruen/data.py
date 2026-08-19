@@ -22,6 +22,6 @@ class MyDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         end = start + self.segment_length
 
         x = self.dry[:, start:end]
-        y = self.dry[:, start:end]
+        y = self.wet[:, start:end]
 
         return x, y
