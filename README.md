@@ -1,4 +1,6 @@
-# psd-laruen
+# PSD-larueN
+
+A machine learning amplifier. Inspired by Neural DSP.
 
 ## Setup
 
@@ -15,6 +17,10 @@ You can get some for free from [ML Sound Lab](https://ml-sound-lab.com/pages/fre
 ```
 uv run play stream clean assets/cabinets/Tube\ Color.wav data/Ibanez2820-DI.wav
 
-uv run play process metal assets/cabinets/Tube\ Color.wav data/Ibanez2820-DI.wav -o output.wav
+uv run play process metal assets/cabinets/Tube\ Color.wav data/Ibanez2820-DI.wav -o data/output.wav
+
+uv run train data/Ibanez2820-DI.wav data/output.wav
+
+uv run wavenet data/Ibanez2820-DI.wav
 ```
 
