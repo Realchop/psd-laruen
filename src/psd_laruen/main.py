@@ -170,7 +170,7 @@ def wavenet() -> None:
                 print(f"- Chunk size: {chunk_size}")
                 started = datetime.now().timestamp()
                 print(f"- Began inference at: {started}")
-                _ = model.process_signal(x, 1024)
+                _ = model.process_signal(x, chunk_size)
                 ended = datetime.now().timestamp()
                 print(f"- Ended inference at: {ended}")
                 took = ended - started
