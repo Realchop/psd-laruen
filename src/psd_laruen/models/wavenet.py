@@ -141,7 +141,7 @@ class WaveNet(L.LightningModule):
         x, y = batch
         y_hat = self(x)
         loss = F.mse_loss(y_hat, y)
-        self.log("train_loss", loss, prog_bar=True)
+        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
         return loss
 
     def validation_step(
@@ -152,7 +152,7 @@ class WaveNet(L.LightningModule):
         x, y = batch
         y_hat = self(x)
         loss = F.mse_loss(y_hat, y)
-        self.log("val_loss", loss, prog_bar=True)
+        self.log("val_loss", loss, on_epoch=True, prog_bar=True)
         return loss
 
     def configure_optimizers(self) -> optim.Adam:
