@@ -18,7 +18,8 @@ dependencies = [
 ]
 
 [project.scripts]
-main = "psd_laruen.main:main"
+train = "psd_laruen.main:train"
+wavenet = "psd_laruen.main:wavenet"
 play = "psd_laruen.main:play"
 
 [build-system]
