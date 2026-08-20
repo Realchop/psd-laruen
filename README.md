@@ -2,6 +2,9 @@
 
 ## Setup
 
+You will need some cabinet IR's to get the full experience.               
+You can get some for free from [ML Sound Lab](https://ml-sound-lab.com/pages/free-premium-ir)
+
 ```
 ./scripts/download_data.sh
 
