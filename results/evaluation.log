@@ -1,0 +1,39 @@
+device: cpu
+validation guitar: data/Carrer SG.wav
+
+cabinet-ampformer_187ms      esr= -19.82 dB  pre-emph= -13.60 dB  asr=   1.79 dB
+cabinet-ampformer_48ms       esr= -20.15 dB  pre-emph= -13.79 dB  asr=  -4.20 dB
+cabinet-wavenet_186ms        esr= -44.19 dB  pre-emph= -42.73 dB  asr= -72.20 dB
+cabinet-wavenet_46ms         esr= -40.06 dB  pre-emph= -39.37 dB  asr= -72.22 dB
+clean-ampformer_187ms        esr= -72.23 dB  pre-emph= -55.91 dB  asr= -67.32 dB
+clean-ampformer_48ms         esr= -75.30 dB  pre-emph= -63.37 dB  asr= -67.38 dB
+clean-wavenet_186ms          esr= -45.04 dB  pre-emph= -44.32 dB  asr= -67.40 dB
+clean-wavenet_46ms           esr= -47.83 dB  pre-emph= -45.12 dB  asr= -67.36 dB
+metal-ampformer_187ms        esr= -22.48 dB  pre-emph= -16.72 dB  asr=  -7.78 dB
+metal-ampformer_48ms         esr= -18.98 dB  pre-emph= -15.85 dB  asr=  -8.14 dB
+metal-wavenet_186ms          esr= -31.27 dB  pre-emph= -29.58 dB  asr= -33.09 dB
+metal-wavenet_46ms           esr= -22.06 dB  pre-emph= -22.76 dB  asr= -37.11 dB
+preamp-ampformer_187ms       esr= -21.14 dB  pre-emph= -11.37 dB  asr= -11.10 dB
+preamp-ampformer_48ms        esr= -21.58 dB  pre-emph= -11.55 dB  asr= -10.33 dB
+preamp-wavenet_186ms         esr= -36.48 dB  pre-emph= -30.79 dB  asr= -17.02 dB
+preamp-wavenet_46ms          esr= -30.40 dB  pre-emph= -24.77 dB  asr= -18.23 dB
+
+run                            ESR dB  preESR dB   MRSTFT   ASR dB   params  ctx ms
+clean-ampformer_48ms           -75.30     -63.37   0.0567   -67.38   207297    47.9
+clean-ampformer_187ms          -72.23     -55.91   0.0833   -67.32   207297   187.2
+clean-wavenet_46ms             -47.83     -45.12   0.0479   -67.36   205505    46.4
+clean-wavenet_186ms            -45.04     -44.32   0.0475   -67.40   243265   185.7
+cabinet-wavenet_186ms          -44.19     -42.73   0.1151   -72.20   243265   185.7
+cabinet-wavenet_46ms           -40.06     -39.37   0.1211   -72.22   205505    46.4
+preamp-wavenet_186ms           -36.48     -30.79   0.0600   -17.02   243265   185.7
+metal-wavenet_186ms            -31.27     -29.58   0.1164   -33.09   243265   185.7
+preamp-wavenet_46ms            -30.40     -24.77   0.1549   -18.23   205505    46.4
+metal-ampformer_187ms          -22.48     -16.72   0.7687    -7.78   207297   187.2
+metal-wavenet_46ms             -22.06     -22.76   0.2150   -37.11   205505    46.4
+preamp-ampformer_48ms          -21.58     -11.55   0.5811   -10.33   207297    47.9
+preamp-ampformer_187ms         -21.14     -11.37   0.5744   -11.10   207297   187.2
+cabinet-ampformer_48ms         -20.15     -13.79   1.5429    -4.20   207297    47.9
+cabinet-ampformer_187ms        -19.82     -13.60   1.5948     1.79   207297   187.2
+metal-ampformer_48ms           -18.98     -15.85   0.7938    -8.14   207297    47.9
+
+wrote results/evaluation.csv

@@ -4,7 +4,22 @@ import lightning as L
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
+from lightning.pytorch.utilities.types import OptimizerLRScheduler
+
+from ..losses import AmpLoss
+from ..optim import build_optimizer
+
+# Loss weights may legitimately be zero, so they are excluded from the
+# must-be-positive check below.
+STRUCTURAL_HPARAMS = (
+    "in_channels",
+    "out_channels",
+    "residual_channels",
+    "skip_channels",
+    "kernel_size",
+    "dilation_depth",
+    "dilation_repeat",
+)
 
 
 class CausalConv1d(nn.Module):
@@ -64,6 +79,13 @@ class WaveNetLayer(nn.Module):
 
 
 class WaveNet(L.LightningModule):
+    # nn.Module's __getattr__ widens plain attributes to Tensor | Module as far
+    # as pyright is concerned, so spell these out. Lightning hates having
+    # proper types 🥀
+    learning_rate: float
+    weight_decay: float
+    warmup_steps: int
+
     def __init__(
         self,
         in_channels: int = 1,
@@ -74,17 +96,35 @@ class WaveNet(L.LightningModule):
         dilation_depth: int = 10,
         dilation_repeat: int = 2,
         learning_rate: float = 1e-3,
+        weight_decay: float = 0.0,
+        warmup_steps: int = 0,
+        esr_weight: float = 1.0,
+        pre_emphasis_weight: float = 1.0,
+        stft_weight: float = 1.0,
+        dc_weight: float = 1.0,
     ) -> None:
         super().__init__()
 
         self.save_hyperparameters()
 
         # Lightning hates having proper types 🥀
-        for param in self.hparams:  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+        for param in STRUCTURAL_HPARAMS:
             if self.hparams[param] <= 0:  # pyright: ignore[reportUnknownMemberType]
                 raise ValueError(f"{param} must be greater than 0")
 
+        if learning_rate <= 0:
+            raise ValueError("learning_rate must be greater than 0")
+
         self.learning_rate = learning_rate
+        self.weight_decay = weight_decay
+        self.warmup_steps = warmup_steps
+
+        self.criterion = AmpLoss(
+            esr_weight=esr_weight,
+            pre_emphasis_weight=pre_emphasis_weight,
+            stft_weight=stft_weight,
+            dc_weight=dc_weight,
+        )
 
         self.input_conv = CausalConv1d(in_channels, residual_channels, 1)
 
@@ -103,6 +143,12 @@ class WaveNet(L.LightningModule):
 
         self.output_conv1 = nn.Conv1d(skip_channels, skip_channels, 1)
         self.output_conv2 = nn.Conv1d(skip_channels, out_channels, 1)
+
+    @property
+    def receptive_field(self) -> int:
+        return 1 + sum(
+            cast(WaveNetLayer, layer).causal_conv.padding for layer in self.layers
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         input_dim = x.dim()
@@ -133,30 +179,63 @@ class WaveNet(L.LightningModule):
             out = out.squeeze(1)
         return out
 
+    def _step(
+        self,
+        batch: tuple[torch.Tensor, torch.Tensor],
+        stage: str,
+    ) -> torch.Tensor:
+        x, y = batch
+
+        # The dry segment carries a lead-in that the target does not, so score
+        # only the tail -- the part that had a full history behind it.
+        y_hat = self(x)[..., -y.shape[-1] :]
+        losses = self.criterion(y_hat, y)
+
+        on_step = stage == "train"
+        self.log_dict(
+            {
+                f"{stage}_{name}": value
+                for name, value in losses.items()
+                if name != "loss"
+            },
+            on_step=on_step,
+            on_epoch=True,
+        )
+        self.log(
+            f"{stage}_loss",
+            losses["loss"],
+            on_step=on_step,
+            on_epoch=True,
+            prog_bar=True,
+        )
+
+        return losses["loss"]
+
     def training_step(
         self,
         batch: tuple[torch.Tensor, torch.Tensor],
         batch_idx: int,
     ) -> torch.Tensor:
-        x, y = batch
-        y_hat = self(x)
-        loss = F.mse_loss(y_hat, y)
-        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
-        return loss
+        return self._step(batch, "train")
 
     def validation_step(
         self,
         batch: tuple[torch.Tensor, torch.Tensor],
         batch_idx: int,
     ) -> torch.Tensor:
-        x, y = batch
-        y_hat = self(x)
-        loss = F.mse_loss(y_hat, y)
-        self.log("val_loss", loss, on_epoch=True, prog_bar=True)
-        return loss
+        return self._step(batch, "val")
 
-    def configure_optimizers(self) -> optim.Adam:
-        return optim.Adam(self.parameters(), lr=self.learning_rate)
+    def configure_optimizers(self) -> OptimizerLRScheduler:
+        # estimated_stepping_batches accounts for epochs, batch size and
+        # accumulation, so the schedule lands exactly at the end of training.
+        total = int(self.trainer.estimated_stepping_batches)
+        return build_optimizer(
+            self.parameters(),
+            self.learning_rate,
+            self.weight_decay,
+            total,
+            self.warmup_steps if self.warmup_steps > 0 else None,
+        )
 
 
 class StreamingWaveNetLayer(nn.Module):

@@ -1,7 +1,16 @@
 data/
 *output*
 typings/
-lightning_logs/
+
+# Training artefacts and licensed audio -- none of this belongs in the repo.
+# assets/ in particular holds cabinet IRs that cannot be redistributed (see
+# 832d693); keeping it ignored is what stops that happening again.
+assets/
+lightning_logs*/
+logs*/
+checkpoints/
+demo/
+*.ckpt
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -62,6 +71,9 @@ cover/
 
 # Django stuff:
 *.log
+# ...but the evaluation console output is a result, not a log: it records the
+# device and held-out guitar the numbers in results/*.csv were produced with.
+!results/*.log
 local_settings.py
 db.sqlite3
 db.sqlite3-journal

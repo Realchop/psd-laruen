@@ -1,16 +1,58 @@
 import argparse
 import json
+import sys
 from datetime import datetime
-from math import sqrt
+from math import log10, sqrt
 from pathlib import Path
 
 import lightning as L
 import torch
-from torch.utils.data import DataLoader
+import torchaudio  # pyright: ignore[reportMissingTypeStubs]
+from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
+from lightning.pytorch.loggers import TensorBoardLogger
+from torch.utils.data import DataLoader, Dataset
 
-from .amps import AMPS, process, stream
-from .data import MyDataset
+from .data import (
+    LEAD_IN,
+    MIN_RMS,
+    SAMPLE_RATE,
+    SEGMENT_LENGTH,
+    AmpDataset,
+    contiguous_split,
+)
+from .inference import find_checkpoint, load_model, receptive_field, render
+from .losses import AmpLoss
+from .metrics import aliasing_to_signal_ratio
 from .models import MODELS, StreamingWaveNet, WaveNet
+
+
+def _datasets(
+    args: argparse.Namespace,
+) -> tuple[
+    Dataset[tuple[torch.Tensor, torch.Tensor]],
+    Dataset[tuple[torch.Tensor, torch.Tensor]],
+]:
+    """Prefer a held-out recording; fall back to a contiguous tail split."""
+    train_dataset = AmpDataset(
+        args.dry,
+        args.wet,
+        segment_length=args.segment,
+        lead_in=args.lead_in,
+        min_rms=args.min_rms,
+    )
+
+    if args.val_dry is None:
+        print("No --val-dry given; holding out the tail of the training audio")
+        return contiguous_split(train_dataset)
+
+    val_dataset = AmpDataset(
+        args.val_dry,
+        args.val_wet,
+        segment_length=args.segment,
+        lead_in=args.lead_in,
+        min_rms=args.min_rms,
+    )
+    return train_dataset, val_dataset
 
 
 def train() -> None:
@@ -26,6 +68,67 @@ def train() -> None:
         "wet",
         type=str,
         help="Path to the processed guitat recording",
+    )
+
+    parser.add_argument(
+        "--val-dry",
+        required=False,
+        type=str,
+        help="Path to a held-out raw recording (a different guitar, ideally)",
+    )
+
+    parser.add_argument(
+        "--val-wet",
+        required=False,
+        type=str,
+        help="Path to the processed version of --val-dry",
+    )
+
+    parser.add_argument(
+        "--name",
+        required=False,
+        type=str,
+        help="Run name; groups checkpoints and logs under lightning_logs/<name>",
+    )
+
+    parser.add_argument(
+        "--segment",
+        required=False,
+        type=int,
+        default=SEGMENT_LENGTH,
+        help="Samples of target audio per training example",
+    )
+
+    parser.add_argument(
+        "--grad-clip",
+        required=False,
+        type=float,
+        default=1.0,
+        help="Gradient norm clipping; 0 disables it",
+    )
+
+    parser.add_argument(
+        "--patience",
+        required=False,
+        type=int,
+        default=40,
+        help="Stop after this many epochs without a val_esr improvement",
+    )
+
+    parser.add_argument(
+        "--min-rms",
+        required=False,
+        type=float,
+        default=MIN_RMS,
+        help="Drop segments whose target is quieter than this RMS (0 keeps all)",
+    )
+
+    parser.add_argument(
+        "--lead-in",
+        required=False,
+        type=int,
+        default=LEAD_IN,
+        help="Samples of warm-up history prepended to each example",
     )
 
     parser.add_argument(
@@ -84,13 +187,13 @@ def train() -> None:
 
     args = parser.parse_args()
 
-    generator = torch.Generator().manual_seed(args.seed)
+    _ = L.seed_everything(args.seed, workers=True)
 
-    dataset = MyDataset(args.dry, args.wet)
+    if (args.val_dry is None) != (args.val_wet is None):
+        print("--val-dry and --val-wet must be given together")
+        return
 
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        dataset, [0.8, 0.2], generator=generator
-    )
+    train_dataset, val_dataset = _datasets(args)
 
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch, shuffle=True, num_workers=args.workers
@@ -118,8 +221,36 @@ def train() -> None:
 
     model = MODELS[args.model](**hyperparameters)
 
-    trainer = L.Trainer(max_epochs=args.epochs, check_val_every_n_epoch=1)
+    # ESR is the comparable number across architectures, so checkpoint on it
+    # rather than on the weighted total.
+    checkpoint = ModelCheckpoint(
+        monitor="val_esr",
+        mode="min",
+        save_top_k=1,
+        save_last=True,
+        filename="{epoch}-{val_esr:.5f}",
+    )
+
+    # Train to convergence rather than to a fixed epoch count: the two
+    # architectures differ ~8x in cost per epoch, so a shared epoch budget
+    # would hand one of them far more compute than the other.
+    early_stop = EarlyStopping(
+        monitor="val_esr", mode="min", patience=args.patience, min_delta=0.0
+    )
+
+    trainer = L.Trainer(
+        max_epochs=args.epochs,
+        check_val_every_n_epoch=1,
+        callbacks=[checkpoint, early_stop],
+        logger=TensorBoardLogger("lightning_logs", name=args.name or "default"),
+        enable_progress_bar=sys.stdout.isatty(),
+        gradient_clip_val=args.grad_clip if args.grad_clip > 0 else None,
+    )
     trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+
+    print(f"Epochs run: {trainer.current_epoch}")
+    print(f"Best val_esr: {checkpoint.best_model_score}")
+    print(f"Best checkpoint: {checkpoint.best_model_path}")  # pyright: ignore[reportUnknownMemberType]
 
 
 def wavenet() -> None:
@@ -136,7 +267,7 @@ def wavenet() -> None:
     args = parser.parse_args()
 
     max_id = args.max_samples
-    dataset = MyDataset(args.dry, args.dry)
+    dataset = AmpDataset(args.dry, args.dry, segment_length=3 * SAMPLE_RATE, lead_in=0)
     loader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=7)
 
     checkpoint = args.checkpoint
@@ -209,14 +340,254 @@ def wavenet() -> None:
         print(f"Most stable: {sizes[best_std_index]}")
 
 
+def _evaluate_run(
+    run: str,
+    checkpoint: Path,
+    guitar: str,
+    target_root: str,
+    batch: int,
+    workers: int,
+    device: torch.device,
+) -> dict[str, float] | None:
+    """Metrics for one trained model on the held-out guitar."""
+    amp = run.split("-")[0]
+    target = Path(target_root) / f"CareerSG__{amp}.wav"
+    if not target.exists():
+        return None
+
+    model = load_model(checkpoint)
+    _ = model.to(device)
+    criterion = AmpLoss().to(device)
+
+    dataset = AmpDataset(guitar, str(target))
+    loader = DataLoader(dataset, batch_size=batch, shuffle=False, num_workers=workers)
+
+    totals: dict[str, float] = {}
+    seen = 0
+    with torch.inference_mode():
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            predicted = model(x)[..., -y.shape[-1] :]
+            losses = criterion(predicted, y)
+            n = x.shape[0]
+            for name, value in losses.items():
+                totals[name] = totals.get(name, 0.0) + float(value) * n
+            seen += n
+
+    metrics = {name: total / seen for name, total in totals.items()}
+
+    # ASR drives the model with a single sine, so it runs on the raw forward
+    # pass rather than the dataset.
+    align = int(getattr(model, "chunk_size", 1) or 1)
+
+    def process(signal: torch.Tensor) -> torch.Tensor:
+        with torch.inference_mode():
+            return model(signal.to(device)).cpu()
+
+    asr, harmonic = aliasing_to_signal_ratio(process, align=align)
+    metrics["asr"] = asr
+    metrics["harmonic_energy"] = harmonic
+    metrics["params"] = float(sum(p.numel() for p in model.parameters()))
+    metrics["receptive_field"] = float(receptive_field(model))
+    metrics["segments"] = float(len(dataset))
+    return metrics
+
+
+def evaluate() -> int:
+    """Score every trained model on the held-out guitar, plus aliasing."""
+    parser = argparse.ArgumentParser(
+        description="Evaluate every trained model in lightning_logs/"
+    )
+    parser.add_argument("--logs", type=str, default="lightning_logs")
+    parser.add_argument("--targets", type=str, default="data/targets")
+    parser.add_argument("--val-dry", type=str, default="data/Carrer SG.wav")
+    parser.add_argument("-b", "--batch", type=int, default=16)
+    parser.add_argument("-w", "--workers", type=int, default=4)
+    parser.add_argument("--csv", type=str, required=False, help="Also write a CSV here")
+    parser.add_argument("--device", type=str, required=False)
+    args = parser.parse_args()
+
+    device = torch.device(
+        args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    )
+    print(f"device: {device}")
+    print(f"validation guitar: {args.val_dry}\n")
+
+    runs = sorted(p.name for p in Path(args.logs).glob("*") if p.is_dir())
+    rows: dict[str, dict[str, float]] = {}
+    for run in runs:
+        try:
+            checkpoint = find_checkpoint(run, args.logs)
+        except FileNotFoundError:
+            print(f"{run:28s} no checkpoint yet -- skipped")
+            continue
+        result = _evaluate_run(
+            run,
+            checkpoint,
+            args.val_dry,
+            args.targets,
+            args.batch,
+            args.workers,
+            device,
+        )
+        if result is None:
+            print(f"{run:28s} no target audio -- skipped")
+            continue
+        rows[run] = result
+        print(
+            f"{run:28s} esr={10 * log10(result['esr']):7.2f} dB  "
+            f"pre-emph={10 * log10(result['pre_emphasis']):7.2f} dB  "
+            f"asr={10 * log10(result['asr'] + 1e-20):7.2f} dB"
+        )
+
+    if not rows:
+        print("\nNothing to evaluate.")
+        return 1
+
+    print(
+        f"\n{'run':28s} {'ESR dB':>8s} {'preESR dB':>10s} {'MRSTFT':>8s} "
+        f"{'ASR dB':>8s} {'params':>8s} {'ctx ms':>7s}"
+    )
+    for run, m in sorted(rows.items(), key=lambda kv: kv[1]["esr"]):
+        print(
+            f"{run:28s} {10 * log10(m['esr']):8.2f} "
+            f"{10 * log10(m['pre_emphasis']):10.2f} {m['stft']:8.4f} "
+            f"{10 * log10(m['asr'] + 1e-20):8.2f} {int(m['params']):8d} "
+            f"{m['receptive_field'] / SAMPLE_RATE * 1000:7.1f}"
+        )
+
+    if args.csv:
+        columns = [
+            "esr",
+            "pre_emphasis",
+            "stft",
+            "dc",
+            "asr",
+            "params",
+            "receptive_field",
+            "segments",
+        ]
+        with open(args.csv, "w", encoding="utf-8") as f:
+            _ = f.write("run," + ",".join(columns) + "\n")
+            for run, m in sorted(rows.items()):
+                _ = f.write(
+                    run + "," + ",".join(f"{m.get(c, 0.0):.8g}" for c in columns) + "\n"
+                )
+        print(f"\nwrote {args.csv}")
+
+    return 0
+
+
+def demo() -> int:
+    """Write dry / target / predicted audio side by side, so it can be heard."""
+    parser = argparse.ArgumentParser(
+        description="Render an excerpt through a trained model, for listening"
+    )
+
+    parser.add_argument("run", type=str, help="Run name under lightning_logs/")
+    parser.add_argument("dry", type=str, help="Raw guitar recording")
+    parser.add_argument(
+        "-t", "--target", type=str, required=False, help="Processed reference audio"
+    )
+    parser.add_argument(
+        "-o", "--out", type=str, default="demo", help="Directory for the wav files"
+    )
+    parser.add_argument(
+        "--start", type=float, default=30.0, help="Excerpt start, in seconds"
+    )
+    parser.add_argument(
+        "--seconds", type=float, default=15.0, help="Excerpt length, in seconds"
+    )
+    parser.add_argument(
+        "--checkpoint", type=str, required=False, help="Override the checkpoint used"
+    )
+    parser.add_argument(
+        "--peak",
+        type=float,
+        default=0.95,
+        help="Scale all three files by one common gain so the loudest hits this",
+    )
+
+    args = parser.parse_args()
+
+    try:
+        checkpoint = (
+            Path(args.checkpoint) if args.checkpoint else find_checkpoint(args.run)
+        )
+    except FileNotFoundError as e:
+        print(e)
+        return 1
+
+    model = load_model(checkpoint)
+    field = receptive_field(model)
+    print(f"run        : {args.run}")
+    print(f"checkpoint : {checkpoint}")
+    print(f"model      : {type(model).__name__}")
+    print(f"context    : {field} samples = {field / SAMPLE_RATE * 1000:.1f} ms")
+
+    dry, sample_rate = torchaudio.load(  # pyright: ignore[reportUnknownMemberType]
+        args.dry,
+        frame_offset=int(args.start * SAMPLE_RATE),
+        num_frames=int(args.seconds * SAMPLE_RATE),
+    )
+    if dry.shape[-1] == 0:
+        print(f"No audio at {args.start}s in {args.dry}")
+        return 1
+
+    predicted = render(model, dry)
+
+    tracks = {"dry": dry, "pred": predicted}
+    if args.target:
+        target, _ = torchaudio.load(  # pyright: ignore[reportUnknownMemberType]
+            args.target,
+            frame_offset=int(args.start * SAMPLE_RATE),
+            num_frames=int(args.seconds * SAMPLE_RATE),
+        )
+        tracks["target"] = target
+        losses = AmpLoss()(predicted.unsqueeze(0), target.unsqueeze(0))
+        print(
+            f"\nesr on this excerpt : {losses['esr'].item():.6g} "
+            f"({10 * log10(losses['esr'].item()):.1f} dB)"
+        )
+        for name in ("pre_emphasis", "stft", "dc"):
+            print(f"{name:19s} : {losses[name].item():.6g}")
+
+    # One common gain across all three, so a loudness difference between the
+    # target and the prediction stays audible instead of being normalised away.
+    loudest = max(float(t.abs().max()) for t in tracks.values())
+    gain = args.peak / loudest if loudest > 0 else 1.0
+
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    print(f"\ncommon gain applied : {gain:.4f}")
+    for name, track in tracks.items():
+        path = out / f"{args.run}__{name}.wav"
+        torchaudio.save(str(path), track * gain, sample_rate)  # pyright: ignore[reportUnknownMemberType]
+        peak = float(track.abs().max())
+        print(f"  {path}  peak {peak:.3f}{'  (was clipping)' if peak > 1.0 else ''}")
+
+    return 0
+
+
 def play() -> int:
+    # Imported here rather than at module scope: pedalboard is a native
+    # extension and only the amps need it, so a broken or missing build must
+    # not stop anyone from training.
+    from .amps import AMPS, process, stream
+
     parser = argparse.ArgumentParser(
         description="Process or stream audio files through digital amps"
     )
 
     parser.add_argument("operation", type=str, choices=["process", "stream"])
     parser.add_argument("amp", type=str, help="amp to use", choices=AMPS.keys())
-    parser.add_argument("cabinet", type=str, help="IR cabinet to use")
+    parser.add_argument(
+        "cabinet",
+        type=str,
+        nargs="?",
+        default="",
+        help="IR cabinet to use (unused by the clean and preamp amps)",
+    )
     parser.add_argument("input", type=str, help="audio to transform")
     parser.add_argument(
         "-o", "--output", type=str, required=False, help="output location"

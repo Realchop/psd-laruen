@@ -21,6 +21,7 @@ dependencies = [
 train = "psd_laruen.main:train"
 wavenet = "psd_laruen.main:wavenet"
 play = "psd_laruen.main:play"
+demo = "psd_laruen.main:demo"
 
 [build-system]
 requires = ["uv_build>=0.12.3,<0.13.0"]

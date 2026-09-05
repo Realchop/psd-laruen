@@ -13,15 +13,29 @@ from pedalboard import (
 from pedalboard._pedalboard import Pedalboard
 from pedalboard.io import AudioFile, AudioStream
 
+
+# Shared by `preamp` and `metal`; `metal` is this chain plus a cabinet.
+def _preamp_stages() -> Pedalboard:
+    return Pedalboard(
+        [
+            NoiseGate(threshold_db=-45.0, ratio=10.0, release_ms=50.0),
+            HighpassFilter(cutoff_frequency_hz=200.0),
+            Distortion(drive_db=35.0),
+            LowShelfFilter(cutoff_frequency_hz=120.0, gain_db=6.0),
+            PeakFilter(cutoff_frequency_hz=750.0, gain_db=-12.0, q=1.5),
+            PeakFilter(cutoff_frequency_hz=2200.0, gain_db=3.0, q=1.0),
+            HighShelfFilter(cutoff_frequency_hz=5000.0, gain_db=6.0),
+        ]
+    )
+
+
+# Nonlinear but short memory: the whole chain fits inside a few milliseconds,
+# which isolates the distortion from the long tail a cabinet adds.
+preamp: Callable[[str], Pedalboard] = lambda _: _preamp_stages()
+
 metal: Callable[[str], Pedalboard] = lambda cabinet: Pedalboard(
     [
-        NoiseGate(threshold_db=-45.0, ratio=10.0, release_ms=50.0),
-        HighpassFilter(cutoff_frequency_hz=200.0),
-        Distortion(drive_db=35.0),
-        LowShelfFilter(cutoff_frequency_hz=120.0, gain_db=6.0),
-        PeakFilter(cutoff_frequency_hz=750.0, gain_db=-12.0, q=1.5),
-        PeakFilter(cutoff_frequency_hz=2200.0, gain_db=3.0, q=1.0),
-        HighShelfFilter(cutoff_frequency_hz=5000.0, gain_db=6.0),
+        *_preamp_stages(),
         Convolution(
             impulse_response_filename=cabinet,
             mix=1.0,
@@ -44,6 +58,7 @@ AMPS: dict[str, Callable[[str], Pedalboard]] = {
     "metal": metal,
     "clean": clean,
     "cabinet": cabinet,
+    "preamp": preamp,
 }
 
 

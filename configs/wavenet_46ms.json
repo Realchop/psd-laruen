@@ -1,0 +1,7 @@
+{
+  "dilation_depth": 10,
+  "dilation_repeat": 2,
+  "learning_rate": 0.001,
+  "weight_decay": 0.01,
+  "warmup_steps": 0
+}

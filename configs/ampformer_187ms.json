@@ -1,0 +1,11 @@
+{
+  "chunk_size": 64,
+  "model_dim": 64,
+  "feedforward_dim": 256,
+  "num_heads": 4,
+  "num_layers": 4,
+  "window": 33,
+  "learning_rate": 0.001,
+  "weight_decay": 0.01,
+  "warmup_steps": 0
+}
