@@ -1,11 +1,7 @@
 """Loss functions for black-box amplifier modelling.
 
 Plain MSE is a poor fit for this task: it is dominated by the high energy
-fundamental, while the character of an amp lives in the comparatively quiet
-harmonics it generates. The losses here follow the virtual analog literature
-instead -- error-to-signal ratio, pre-emphasised to weight the harmonics, plus
-a multi-resolution spectral term.
-"""
+fundamental,"""
 
 from collections.abc import Sequence
 
@@ -30,9 +26,6 @@ def _as_batched(x: torch.Tensor) -> torch.Tensor:
 
 class ESRLoss(nn.Module):
     """Error-to-signal ratio, normalised per item rather than per batch.
-
-    Dividing by the target energy makes a quietly played segment count as much
-    as a loud one, which plain MSE does not.
     """
 
     def __init__(self, epsilon: float = EPSILON) -> None:
@@ -61,11 +54,7 @@ class DCLoss(nn.Module):
 
 
 class PreEmphasis(nn.Module):
-    """First order high-pass, `y[n] = x[n] - coefficient * x[n - 1]`.
-
-    Applied to both prediction and target before the error is taken, so that
-    the loss actually cares about the harmonics an amp generates.
-    """
+    """First order high-pass, `y[n] = x[n] - coefficient * x[n - 1]`."""
 
     kernel: torch.Tensor
 
@@ -84,11 +73,7 @@ class PreEmphasis(nn.Module):
 
 
 class MultiResolutionSTFTLoss(nn.Module):
-    """Spectral convergence plus log-magnitude L1, averaged over FFT sizes.
-
-    Catches spectral envelope errors that a time domain loss misses, and is
-    forgiving of the sub-sample misalignment that a time domain loss is not.
-    """
+    """Compares spectrograms instead of waveforms."""
 
     def __init__(
         self,
@@ -103,11 +88,6 @@ class MultiResolutionSTFTLoss(nn.Module):
             raise ValueError("magnitude_floor must be greater than 0")
         self.fft_sizes = tuple(fft_sizes)
         self.epsilon = epsilon
-        # Bounds the log-magnitude term, which would otherwise reach for
-        # log(0) on an empty bin. It does NOT rescue the convergence term on a
-        # silent target -- a relative error is undefined there, and flooring
-        # every bin just scales the reference with the bin count. Excluding
-        # silent segments is the dataset's job (see data.MIN_RMS).
         self.magnitude_floor = magnitude_floor
 
     def _magnitude(self, x: torch.Tensor, n_fft: int) -> torch.Tensor:
@@ -121,7 +101,6 @@ class MultiResolutionSTFTLoss(nn.Module):
             center=True,
             return_complex=True,
         )
-        # abs() has no gradient at zero, so take the norm by hand.
         magnitude = torch.sqrt(spectrum.real**2 + spectrum.imag**2 + self.epsilon)
         return magnitude.clamp_min(self.magnitude_floor)
 

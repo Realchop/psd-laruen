@@ -1,5 +1,3 @@
-"""Paired dry/wet audio, served in segments with a warm-up lead-in."""
-
 import torch
 import torchaudio  # pyright: ignore[reportMissingTypeStubs]
 from torch.utils.data import Dataset, Subset
@@ -10,23 +8,10 @@ SAMPLE_RATE = 44_100
 # 256. AmpFormer rejects anything that does not divide evenly.
 SEGMENT_LENGTH = 44_032  # ~0.999 seconds
 LEAD_IN = 22_016  # ~0.499 seconds
-# Every loss here is relative to the target, so a target with no signal in it
-# divides by almost nothing. -40 dBFS drops 1.3% of segments and cuts the
-# spread of per-segment loss from ~950x to ~10x. Measured, not guessed.
 MIN_RMS = 1e-2  # -40 dBFS
 
 
 class AmpDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
-    """Segments of dry input paired with the matching wet target.
-
-    Each item hands back `lead_in + segment_length` samples of dry audio but
-    only `segment_length` samples of wet audio. The extra dry audio at the
-    front is history: without it the first samples of every segment would be
-    predicted from an all-zero past, which no model can get right and which
-    therefore only adds noise to the gradient. Models are expected to trim
-    their output to the target length, keeping the tail.
-    """
-
     def __init__(
         self,
         dry_path: str,
@@ -53,7 +38,6 @@ class AmpDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
                 f"channel count mismatch: {dry.shape[0]} vs {wet.shape[0]}"
             )
 
-        # Some processors return a sample or two more than they were given.
         frames = min(dry.shape[-1], wet.shape[-1])
         self.dry = dry[..., :frames]
         self.wet = wet[..., :frames]
@@ -69,9 +53,6 @@ class AmpDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
                 f"{segment_length} plus lead_in {lead_in}"
             )
 
-        # A segment with no signal in it says nothing about the amp, and every
-        # loss here is relative to the target, so an all-but-silent target
-        # divides by almost nothing and swamps the batch.
         self.segments = self._loud_segments(candidates, min_rms)
         if not self.segments:
             raise ValueError(f"every segment is quieter than min_rms {min_rms}")
@@ -111,13 +92,6 @@ def contiguous_split(
 ) -> tuple[
     Subset[tuple[torch.Tensor, torch.Tensor]], Subset[tuple[torch.Tensor, torch.Tensor]]
 ]:
-    """Split off a validation tail without interleaving it with training data.
-
-    A random split over segments of one continuous recording puts validation
-    segments physically between training segments -- same take, same note, same
-    tone -- so validation loss reads as interpolation rather than
-    generalisation. Holding out the tail avoids that.
-    """
     if not 0.0 < train_fraction < 1.0:
         raise ValueError("train_fraction must be in (0, 1)")
 

@@ -1,26 +1,10 @@
 """A block-causal transformer for amplifier modelling.
 
-Attention cannot run at the sample rate: a 3 second segment is 132,300
-samples, and comparing every position against every other is ~1.75e10 pairs.
-So samples are grouped into fixed chunks first, which brings a 1 second
-segment down to ~689 positions.
+Attention is quadratic, so samples are grouped into chunks of `chunk_size`
+before attending rather than run at the sample rate.
 
-Grouping has a price. The model now emits one thing per chunk, while audio has
-to be exact per sample, and neighbouring chunks are computed independently --
-so nothing forces the last sample of one chunk to meet the first sample of the
-next. Any mismatch repeats at `sample_rate / chunk_size` Hz, which is audible
-as a buzz. This implementation gives the network what it needs to avoid that
-(every chunk sees the raw input of its predecessors, so it can work out where
-the previous chunk must have ended) and leaves the rest to training. If the
-seams turn out to be audible, the fallback is to stop predicting samples from
-chunk summaries and predict filter coefficients instead.
-
-The window is quoted in chunks, so with `chunk_size=64`:
-
-    window=32   ->  2048 samples = 46.4 ms, matching WaveNet
-    window=128  ->  8192 samples = 185.8 ms, matching WaveNet at depth 12
-
-which keeps the comparison against the convolutional baselines honest.
+`window` is counted in chunks, not samples: at `chunk_size=64`, window=32 is
+2048 samples (46 ms), matching WaveNet; window=128 matches it at depth 12.
 """
 
 import math
@@ -50,12 +34,7 @@ STRUCTURAL_HPARAMS = (
 def rope_cache(
     positions: torch.Tensor, head_dim: int, base: float = 10_000.0
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Rotary position embeddings for the given absolute chunk positions.
-
-    A rotary dot product depends only on the difference between two positions,
-    which is what makes streaming exact: a decoder can carry on counting from
-    wherever it left off and still reproduce the training-time attention.
-    """
+    """Rotary position embeddings for the given absolute chunk positions."""
     if head_dim % 2 != 0:
         raise ValueError("head_dim must be even")
 
@@ -82,8 +61,7 @@ def sliding_causal_mask(
     """True where a query position may attend to a key position.
 
     Query `i` sees keys `i - window + 1 .. i`, so a chunk never sees the
-    future and never reaches further back than the window allows.
-    """
+    future."""
     index = torch.arange(positions, device=device)
     delta = index.unsqueeze(1) - index.unsqueeze(0)
     return (delta >= 0) & (delta < window)
@@ -91,9 +69,6 @@ def sliding_causal_mask(
 
 def window_for_context(samples: int, num_layers: int, chunk_size: int = 64) -> int:
     """Smallest per-layer window whose stacked reach covers `samples`.
-
-    Inverts `receptive_field`, so a config can name the context it wants in
-    samples and not have to account for the compounding over depth.
     """
     if samples <= 0 or num_layers <= 0 or chunk_size <= 0:
         raise ValueError("samples, num_layers and chunk_size must be positive")
@@ -123,7 +98,6 @@ class WindowedSelfAttention(nn.Module):
         batch, positions, _ = x.shape
 
         qkv = self.qkv(x).reshape(batch, positions, 3, self.num_heads, self.head_dim)
-        # (3, batch, heads, positions, head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)
         query, key, value = qkv[0], qkv[1], qkv[2]
 
@@ -159,9 +133,6 @@ class AmpFormerLayer(nn.Module):
 
 
 class AmpFormer(L.LightningModule):
-    # nn.Module's __getattr__ widens plain attributes to Tensor | Module as far
-    # as pyright is concerned, so spell these out. Lightning hates having
-    # proper types 🥀
     learning_rate: float
     weight_decay: float
     warmup_steps: int
@@ -189,7 +160,7 @@ class AmpFormer(L.LightningModule):
         self.save_hyperparameters()
 
         for param in STRUCTURAL_HPARAMS:
-            if self.hparams[param] <= 0:  # pyright: ignore[reportUnknownMemberType]
+            if self.hparams[param] <= 0:  
                 raise ValueError(f"{param} must be greater than 0")
 
         if learning_rate <= 0:
@@ -203,8 +174,6 @@ class AmpFormer(L.LightningModule):
         self.weight_decay = weight_decay
         self.warmup_steps = warmup_steps
 
-        # A chunk is one position, so a stride-equals-kernel convolution is
-        # exactly the chunking plus its linear projection.
         self.patch = nn.Conv1d(
             in_channels, model_dim, kernel_size=chunk_size, stride=chunk_size
         )
@@ -217,8 +186,6 @@ class AmpFormer(L.LightningModule):
             model_dim, out_channels, kernel_size=chunk_size, stride=chunk_size
         )
 
-        # Start as a passthrough: the residual carries the signal and the
-        # network only has to learn the difference the amp makes.
         nn.init.zeros_(self.unpatch.weight)
         if self.unpatch.bias is not None:
             nn.init.zeros_(self.unpatch.bias)
@@ -232,12 +199,7 @@ class AmpFormer(L.LightningModule):
 
     @property
     def receptive_field(self) -> int:
-        """Samples of input that can reach a given output chunk.
-
-        Each layer reaches back `window - 1` chunks, but a layer reads the
-        previous layer's output, so reach compounds over depth exactly as it
-        does in a dilated convolution stack. Verified empirically against the
-        mask, not assumed.
+        """How far back in the input one output sample can see. 
         """
         return (self.num_layers * (self.window - 1) + 1) * self.chunk_size
 
@@ -254,11 +216,6 @@ class AmpFormer(L.LightningModule):
             x = x.unsqueeze(1)
 
         samples = x.shape[-1]
-        # Left-padding to reach a whole number of chunks would move the chunk
-        # grid by however much was padded, so the same audio would be cut into
-        # chunks differently depending on the length of the window it arrived
-        # in -- training one way, block-wise inference another. Refuse instead:
-        # a silent phase shift is far harder to notice than an exception.
         if samples % self.chunk_size != 0:
             raise ValueError(
                 f"input length {samples} is not a multiple of chunk_size "
@@ -325,8 +282,6 @@ class AmpFormer(L.LightningModule):
         return self._step(batch, "val")
 
     def configure_optimizers(self) -> OptimizerLRScheduler:
-        # estimated_stepping_batches accounts for epochs, batch size and
-        # accumulation, so the schedule lands exactly at the end of training.
         total = int(self.trainer.estimated_stepping_batches)
         return build_optimizer(
             self.parameters(),

@@ -7,17 +7,10 @@ import torch
 
 from .models import AmpFormer, WaveNet
 
-# A model's own receptive field is the minimum context each block needs; this
-# multiplies it for margin, since a warm-up is cheap and a cold start is not.
 LEAD_IN_FACTOR = 2
 
 
 def model_class(state_dict: dict[str, torch.Tensor]) -> type[L.LightningModule]:
-    """Work out which architecture a checkpoint holds, from its weights.
-
-    Lightning stores hyperparameters but not the class, so identify the model
-    by a layer only it has.
-    """
     if any(key.startswith("patch.") for key in state_dict):
         return AmpFormer
     if any(key.startswith("input_conv.") for key in state_dict):
@@ -47,8 +40,6 @@ def find_checkpoint(run: str, root: str = "lightning_logs") -> Path:
         raise FileNotFoundError(f"no runs found under {root}/{run}")
 
     for version in reversed(versions):
-        # ModelCheckpoint writes the monitored score into the filename, so the
-        # one that is not `last` is the best one.
         best = [c for c in version.glob("checkpoints/*.ckpt") if c.stem != "last"]
         if best:
             return best[0]
