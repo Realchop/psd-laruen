@@ -10,6 +10,7 @@ import torch
 import torchaudio  # pyright: ignore[reportMissingTypeStubs]
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers import TensorBoardLogger
+from lightning.pytorch.tuner import Tuner
 from torch.utils.data import DataLoader, Dataset
 
 from .data import (
@@ -53,6 +54,28 @@ def _datasets(
         min_rms=args.min_rms,
     )
     return train_dataset, val_dataset
+
+
+def _find_lr(
+    trainer: L.Trainer,
+    model: L.LightningModule,
+    train_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
+) -> None:
+    """Run a learning rate range test and adopt its suggestion."""
+    tuner = Tuner(trainer)
+    finder = tuner.lr_find(model, train_dataloaders=train_loader)
+
+    if finder is None or (suggestion := finder.suggestion()) is None:
+        print("No clear minimum in the range test; keeping the configured rate")
+        return
+
+    print(f"Suggested learning rate: {suggestion:.3e}")
+
+    curve = Path(trainer.log_dir or ".") / "lr_find.json"
+    curve.parent.mkdir(parents=True, exist_ok=True)
+    with open(curve, "w", encoding="utf-8") as f:
+        json.dump({"suggestion": suggestion, **finder.results}, f)
+    print(f"Range test curve written to {curve}")
 
 
 def train() -> None:
@@ -185,6 +208,19 @@ def train() -> None:
         help="Path to a .json file containg model hyperparameters",
     )
 
+    parser.add_argument(
+        "--learning-rate",
+        required=False,
+        type=float,
+        help="Override the learning rate from --config; one point of the sweep",
+    )
+
+    parser.add_argument(
+        "--find-lr",
+        action="store_true",
+        help="Range-test the learning rate before training and use the suggestion",
+    )
+
     args = parser.parse_args()
 
     _ = L.seed_everything(args.seed, workers=True)
@@ -219,10 +255,12 @@ def train() -> None:
         except OSError as e:
             print(f"I/O error reading file: {e}")
 
+    if args.learning_rate is not None:
+        hyperparameters["learning_rate"] = args.learning_rate
+        print(f"Learning rate overridden from the command line: {args.learning_rate}")
+
     model = MODELS[args.model](**hyperparameters)
 
-    # ESR is the comparable number across architectures, so checkpoint on it
-    # rather than on the weighted total.
     checkpoint = ModelCheckpoint(
         monitor="val_esr",
         mode="min",
@@ -231,9 +269,6 @@ def train() -> None:
         filename="{epoch}-{val_esr:.5f}",
     )
 
-    # Train to convergence rather than to a fixed epoch count: the two
-    # architectures differ ~8x in cost per epoch, so a shared epoch budget
-    # would hand one of them far more compute than the other.
     early_stop = EarlyStopping(
         monitor="val_esr", mode="min", patience=args.patience, min_delta=0.0
     )
@@ -246,6 +281,9 @@ def train() -> None:
         enable_progress_bar=sys.stdout.isatty(),
         gradient_clip_val=args.grad_clip if args.grad_clip > 0 else None,
     )
+    if args.find_lr:
+        _find_lr(trainer, model, train_loader)
+
     trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
     print(f"Epochs run: {trainer.current_epoch}")
@@ -325,7 +363,6 @@ def wavenet() -> None:
             print(f"Mean: {mean}")
             means.append(mean)
 
-            # Use uncorrected std in case of one sample
             if n == 1:
                 n += 1
             std = sqrt(sum([(t - mean) ** 2 for t in times]) / (n - 1))
@@ -376,8 +413,6 @@ def _evaluate_run(
 
     metrics = {name: total / seen for name, total in totals.items()}
 
-    # ASR drives the model with a single sine, so it runs on the raw forward
-    # pass rather than the dataset.
     align = int(getattr(model, "chunk_size", 1) or 1)
 
     def process(signal: torch.Tensor) -> torch.Tensor:
@@ -552,8 +587,6 @@ def demo() -> int:
         for name in ("pre_emphasis", "stft", "dc"):
             print(f"{name:19s} : {losses[name].item():.6g}")
 
-    # One common gain across all three, so a loudness difference between the
-    # target and the prediction stays audible instead of being normalised away.
     loudest = max(float(t.abs().max()) for t in tracks.values())
     gain = args.peak / loudest if loudest > 0 else 1.0
 
@@ -570,9 +603,6 @@ def demo() -> int:
 
 
 def play() -> int:
-    # Imported here rather than at module scope: pedalboard is a native
-    # extension and only the amps need it, so a broken or missing build must
-    # not stop anyone from training.
     from .amps import AMPS, process, stream
 
     parser = argparse.ArgumentParser(
